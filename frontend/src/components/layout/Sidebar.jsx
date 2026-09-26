@@ -33,8 +33,6 @@ export default function Sidebar({ mode = "operator" }) {
             to="/operator/explainability"
             className={`doctor-nav-item ${location.pathname === "/operator/explainability" ? "active" : ""}`}
           >
-            <span>✦</span>
-            <span>Explainability</span>
           </Link>
         </nav>
 
@@ -99,7 +97,6 @@ export default function Sidebar({ mode = "operator" }) {
           to="/operator/explainability"
           className={`operator-nav-item ${location.pathname === "/operator/explainability" ? "active" : ""}`}
         >
-          <span>✦</span> Explainability
         </Link>
       </nav>
 
