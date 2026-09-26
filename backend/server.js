@@ -44,15 +44,39 @@ const allowedOrigins = new Set(
 if (process.env.NODE_ENV !== 'production') {
   allowedOrigins.add('http://localhost:5173');
   allowedOrigins.add('http://127.0.0.1:5173');
+  allowedOrigins.add('http://localhost:5174');
+  allowedOrigins.add('http://127.0.0.1:5174');
 }
 
 app.use(cors({
   origin(origin, callback) {
-    callback(null, !origin || allowedOrigins.has(origin));
+    if (!origin) return callback(null, true);
+    // Allow any localhost port in development
+    if (process.env.NODE_ENV !== 'production' && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+      return callback(null, true);
+    }
+    callback(null, allowedOrigins.has(origin));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
 }));
 app.use(express.json({ limit: '1mb' }));
+app.use((req, res, next) => {
+  if (req.path !== '/health') {
+    console.log(`[REQ ${new Date().toLocaleTimeString()}] ${req.method} ${req.path}`, req.body ? JSON.stringify(req.body).slice(0, 100) : '');
+  }
+  next();
+});
+
+// Clerk Server-Side Authentication Middleware
+if (process.env.CLERK_SECRET_KEY) {
+  try {
+    const { clerkMiddleware } = require('@clerk/express');
+    app.use(clerkMiddleware());
+    console.log('Clerk authentication middleware enabled.');
+  } catch (err) {
+    console.warn('Could not initialize @clerk/express:', err.message);
+  }
+}
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -112,7 +136,6 @@ async function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS doctor_reports_scan_created_idx
       ON doctor_reports (scan_id, created_at DESC);
   `);
-  // Users table for registration
   await scansPool.query(`
     CREATE TABLE IF NOT EXISTS users (
       user_id SERIAL PRIMARY KEY,
@@ -130,6 +153,23 @@ async function initializeDatabase() {
       created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
   `);
+
+  // Seed default clinical demo accounts if not already in DB
+  const crypto = require('node:crypto');
+  const opHash = crypto.createHash('sha256').update('OperatorSecure2026!').digest('hex');
+  const docHash = crypto.createHash('sha256').update('RetinaDoc2026!').digest('hex');
+
+  await scansPool.query(`
+    INSERT INTO users (full_name, email, phone, role, organization, center_id, password_hash, status)
+    VALUES ('Alex Rivera', 'alex.rivera@screening.org', '+1 (555) 019-2834', 'operator', 'Central Screening Unit', 'SC-MAIN-001', $1, 'APPROVED')
+    ON CONFLICT (email) DO NOTHING;
+  `, [opHash]);
+
+  await scansPool.query(`
+    INSERT INTO users (full_name, email, phone, role, registration_number, hospital, specialization, password_hash, status)
+    VALUES ('Dr. Sarah Jenkins, MD', 'dr.jenkins@eyeclinics.org', '+1 (555) 234-5678', 'doctor', 'MCI-78291', 'St. Jude Eye Care Center', 'Vitreo-Retinal Specialist', $1, 'APPROVED')
+    ON CONFLICT (email) DO NOTHING;
+  `, [docHash]);
 }
 
 function validScreeningId(value) {
@@ -441,6 +481,130 @@ app.post('/api/register/doctor', async (req, res, next) => {
       res.status(409).json({ error: 'An account with this email already exists.' });
       return;
     }
+    next(error);
+  }
+});
+
+app.post('/api/login', async (req, res, next) => {
+  try {
+    const { email, password, role } = req.body;
+    if (!email || !password) {
+      res.status(400).json({ error: 'Both email and password are required.' });
+      return;
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const { rows } = await scansPool.query(
+      'SELECT * FROM users WHERE LOWER(email) = $1',
+      [cleanEmail]
+    );
+
+    const user = rows[0];
+    if (!user) {
+      res.status(401).json({
+        error: 'No account found with this email in database. Please register an account first.'
+      });
+      return;
+    }
+
+    const crypto = require('node:crypto');
+    const inputHash = crypto.createHash('sha256').update(password).digest('hex');
+
+    if (user.password_hash !== inputHash) {
+      res.status(401).json({ error: 'Incorrect password. Please verify your credentials.' });
+      return;
+    }
+
+    // Role check if specific portal chosen
+    if (role) {
+      const targetRole = role === 'ophthalmologist' ? 'doctor' : role;
+      if (user.role !== targetRole) {
+        res.status(403).json({
+          error: `Access denied: This account is registered as a "${user.role}". Please switch to the ${user.role} login portal.`
+        });
+        return;
+      }
+    }
+
+    const { password_hash, ...safeUser } = user;
+    res.json({
+      message: 'Login successful.',
+      user: safeUser,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/auth/clerk-sync', async (req, res, next) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      res.status(400).json({ error: 'Email is required for verification.' });
+      return;
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const { rows } = await scansPool.query(
+      'SELECT user_id, full_name, email, role, status, organization, center_id, registration_number, hospital, specialization FROM users WHERE LOWER(email) = $1',
+      [cleanEmail]
+    );
+
+    const user = rows[0];
+    if (!user) {
+      res.status(403).json({
+        error: `Access Denied: No account found in the clinical database for "${cleanEmail}". Uncreated or unregistered accounts cannot log in.`,
+        registered: false,
+      });
+      return;
+    }
+
+    if (user.status && user.status.toUpperCase() === 'PENDING') {
+      res.status(403).json({
+        error: `Account Approval Pending: The account for "${cleanEmail}" is awaiting administrative approval before access is granted.`,
+        registered: true,
+        status: 'PENDING',
+      });
+      return;
+    }
+
+    res.json({
+      message: 'Account verified against clinical database.',
+      registered: true,
+      user,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/auth/verify-account', async (req, res, next) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      res.status(400).json({ error: 'Email is required.' });
+      return;
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const { rows } = await scansPool.query(
+      'SELECT user_id, full_name, email, role, status FROM users WHERE LOWER(email) = $1',
+      [cleanEmail]
+    );
+
+    const user = rows[0];
+    if (!user) {
+      res.json({ exists: false, message: 'Account not found in database.' });
+      return;
+    }
+
+    res.json({
+      exists: true,
+      role: user.role,
+      status: user.status,
+      fullName: user.full_name,
+    });
+  } catch (error) {
     next(error);
   }
 });
